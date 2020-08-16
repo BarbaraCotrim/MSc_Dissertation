@@ -1,0 +1,142 @@
+option reset_initial_guesses 0;  # Maintain current variable values as initial guess for next `solve` command
+#option cplex_options "time = 3600";
+option cplex_options 'integrality=1e-12'; # Avoids rounding of variables with values bigger than 10^-12 to integer during B&B
+
+#Time counter
+param start_time;
+param end_time;
+param time_phase_2;
+param total_time;
+
+let start_time:= time(); # Start time counter
+# --------------------------------------------------------------------------------------------------------
+# DEFINING REGULARIZATION SOLUTION AND BIG-M2
+# --------------------------------------------------------------------------------------------------------
+option presolve 0;
+# Leader variables
+let {i in I, t in T} charged[i,t]:= charged_sol[i,t];
+let {i in I, t in T} discharged[i,t]:= discharged_sol[i,t];
+let {i in I, t in T} e_A[i,t]:= e_A_sol[i,t];
+# Follower variables
+let {i in I, t in T} x[i,t]:= x_sol[i,t];
+let {i in I, t in T} y[i,t]:= y_sol[i,t];
+let {i in I, t in T} e_P[i,t]:= e_A_sol[i,t];
+# Auxiliary variables
+let {c in C, i in I, t in T} lambda[c,i,t]:= lambda_sol[c,i,t];
+let {i in I, t in T} mu[i,t]:= mu_sol[i,t];
+let {i in I, t in T} u[i,t]:= u_sol[i,t];
+let {c in C, i in I, t in T} z[c,i,t]:= z_sol[c,i,t];
+option presolve 1;
+
+# Estimated Values of M_2
+let M := 10* min{c in C}M_2[c];
+let {c in C} M_2[c] := M;# * M_2[c];
+
+# --------------------------------------------------------------------------------------------------------
+# MIXED-INTEGER FORMULATION WITH ADJUSTED BIG-M
+# --------------------------------------------------------------------------------------------------------
+problem complete_KKT: profit_aggregator,
+					  charged, discharged, e_A, x, y, e_P, lambda, mu, u, z,
+					  sell, buy, aggregator_fairness, ESS_max_cap, update_e_A, initiate_e_A,
+					  buy_needed, buy_limit, sell_limit, max_cap, update_e_P, initiate_e_P,
+					  stat_x, stat_x_T, stat_y, stat_y_T, stat_e, stat_e_T,
+					  comp_1, comp_2, comp_3, comp_4, comp_5, comp_6, comp_7, comp_lambdas;
+option reset_initial_guesses 0;  # Maintain current variable values as initial guess for next `solve` command
+option presolve 0;
+
+print "BEGIN MIXED INTEGER KKT";
+solve complete_KKT;
+# Feasibility Check
+if (solve_result_num > 99) then {
+	print "INFEASIBLE TERMINATION OF MIXED INTEGER KKT";
+	display solve_result;
+	quit;
+	};
+print "END MIXED INTEGER KKT";
+
+
+let end_time:= time();
+let time_phase_2:= end_time - start_time;
+let total_time:= time_phase_0 + time_phase_1 + time_phase_2;
+
+
+# --------------------------------------------------------------------------------------------------------
+# RESOLVING LOWER LEVELS
+# --------------------------------------------------------------------------------------------------------
+### Fix leader's decision variables ###
+fix {i in I, t in T} e_A[i,t];
+fix {i in I, t in T} charged[i,t];
+fix {i in I, t in T} discharged[i,t];
+
+### Solve Lower levels ###
+problem lower_level{i in I}: prosumer_cost[i],
+					 		 {t in T}x[i,t], {t in T}y[i,t], {t in T}e_P[i,t],
+							 {t in T}buy_needed[i,t], {t in T}buy_limit[i,t], {t in T}sell_limit[i,t], {t in T}max_cap[i,t], {t in T:t>1}update_e_P[i,t], {t in T:t=1}initiate_e_P[i,t];
+option presolve 0;
+
+for {i in I}{
+	print "BEGIN LOWER LEVEL", sprintf("%u", i);
+	solve lower_level[i];
+	print "END LOWER LEVEL", sprintf("%u", i);
+	# Feasibility Check
+	if (solve_result_num > 99) then {
+		print "INFEASIBLE TERMINATION OF LOWER LEVEL",i;
+		display solve_result;
+		quit;
+		};
+	};
+option presolve 1;
+
+### Unfix leader's decision variables ###
+unfix {i in I, t in T} e_A[i,t];
+unfix {i in I, t in T} charged[i,t];
+unfix {i in I, t in T} discharged[i,t];
+
+# --------------------------------------------------------------------------------------------------------
+# DISPLAY OUTPUT
+# --------------------------------------------------------------------------------------------------------
+display time_phase_0, time_phase_1, time_phase_2, total_time;
+display comp_A, comp_U, commission;
+#display x, y, e_P, e_A;
+#display charged, discharged;
+#display lambda, mu, z, u;
+display UL_OBJ_REG;
+
+display profit_aggregator;
+print "Profit aggregator after resolving lower level";
+display sum {i in I,t in T}(B[t]*(S_max[i]-e_P[i,t])+
+							price_W[t]*(discharged[i,t]-charged[i,t])+
+							(commission)*price_W[t]*x[i,t]-
+							(comp_A)*(S_max[i]-e_P[i,t]-e_A[i,t])-
+							(comp_U)*e_A[i,t]);
+
+display {c in C} min{i in I,t in T}lambda_sol[c,i,t], {c in C} min{i in I,t in T}lambda[c,i,t];
+
+
+# --------------------------------------------------------------------------------------------------------
+# FEASIBILITY CHECK FOR ORIGINAL PROBLEM WITH JOINT CONSTRAINT
+# --------------------------------------------------------------------------------------------------------
+### Fix leader's decision variables ###
+fix {i in I, t in T} e_A[i,t];
+fix {i in I, t in T} charged[i,t];
+fix {i in I, t in T} discharged[i,t];
+fix {i in I, t in T} x[i,t];
+fix {i in I, t in T} y[i,t];
+fix {i in I, t in T} e_P[i,t];
+
+### Solve Lower levels ###
+problem original_kkt{i in I}: fake_objective,
+					 		 {c in C, t in T}ori_lambda[c,i,t], {t in T}ori_mu[i,t],
+							 {t in T: t<t_max}ori_stat_x[i,t], {t in T: t<t_max}ori_stat_y[i,t], {t in T: t<t_max}ori_stat_e[i,t],{t in T: t=t_max}ori_stat_x_T[i,t], {t in T: t=t_max}ori_stat_y_T[i,t], {t in T: t=t_max}ori_stat_e_T[i,t],
+							 {t in T}ori_comp_1[i,t],{t in T}ori_comp_2[i,t],{t in T}ori_comp_3[i,t],{t in T}ori_comp_4[i,t],{t in T}ori_comp_5[i,t],{t in T}ori_comp_6[i,t],{t in T}ori_comp_7[i,t], {c in C,t in T}ori_comp_lambdas[c,i,t];
+
+for{i in I}{
+solve original_kkt[i];
+# Feasibility Check
+	if (solve_result_num > 99) then {
+		print "SOLUTION IS INFEASIBLE FOR ORIGINAL LOWER LEVEL",i;
+		display solve_result;
+		print "SOLUTION IS NOT FEASIBLE FOR ORIGINAL BILEVEL WITH JOINT CONSTRAINT";
+		break;
+		};
+};

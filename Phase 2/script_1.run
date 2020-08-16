@@ -1,0 +1,214 @@
+option reset_initial_guesses 0;  # Maintain current variable values as initial guess for next `solve` command
+#option conopt_options ' maxtime=1800';
+
+#Time counter
+param start_time;
+param end_time;
+param total_time;
+
+let start_time:= time();
+
+# --------------------------------------------------------------------------------------------------------
+# DEFINING INITIAL FEASIBLE SOLUTION
+# --------------------------------------------------------------------------------------------------------
+option presolve 0;
+# Leader variables
+let {i in I, t in T} charged[i,t]:= charged_sol[i,t];
+let {i in I, t in T} discharged[i,t]:= discharged_sol[i,t];
+let {i in I, t in T} e_A[i,t]:= e_A_sol[i,t];
+# Follower variables
+let {i in I, t in T} x[i,t]:= x_sol[i,t];
+let {i in I, t in T} y[i,t]:= y_sol[i,t];
+let {i in I, t in T} e_P[i,t]:= e_A_sol[i,t];
+# Auxiliary variables
+let {c in C, i in I, t in T} lambda[c,i,t]:= lambda_sol[c,i,t];
+let {i in I, t in T} mu[i,t]:= mu_sol[i,t];
+option presolve 1;
+
+
+# --------------------------------------------------------------------------------------------------------
+# REGULARIZATION APPROACH
+# All complementarities are regularized ((2) and KKT)
+# --------------------------------------------------------------------------------------------------------
+let r:= 10^(2);
+let ITER:= 1..12; # min 10^-10
+let rho:= 10;
+
+problem regularization{iter in ITER}: profit_aggregator,
+									  charged, discharged, e_A, x, y, e_P, lambda, mu,
+									  aggregator_fairness, ESS_max_cap, update_e_A, initiate_e_A,
+									  buy_needed, buy_limit, sell_limit, max_cap, update_e_P, initiate_e_P, stat_x, stat_x_T, stat_y, stat_y_T, stat_e, stat_e_T,
+									  reg_cons_2, reg_comp_1, reg_comp_2, reg_comp_3, reg_comp_4, reg_comp_5, reg_comp_6, reg_comp_7;
+option reset_initial_guesses 0;  # Maintain current variable values as initial guess for next `solve` command
+#option knitro_options "honorbnds = 0";  # Prevents Knitro from shifting variables/start points
+
+print "BEGIN REGULARIZATION";
+for {iter in ITER}{
+	print ">>> BEGIN ITERATION", sprintf("%u",iter);
+	solve regularization[iter];
+	# Feasibility Check
+	if (solve_result_num > 100) then {
+		print "INFEASIBLE TERMINATION OF REGULARIZATION AT ITERATION",iter;
+		display solve_result;
+		print r;
+		quit;
+		};
+	print ">>> END ITERATION", sprintf("%u",iter);
+	let r:= r/rho;
+	};
+
+print "END REGULARIZATION";
+
+# --------------------------------------------------------------------------------------------------------
+# DEFINING BIG-M AND BINARY VARIABLES
+# --------------------------------------------------------------------------------------------------------
+### Define Big-M constants and initial solution ###
+# Logical Values of M_1
+let M_1[1] := min{i in I, t in T} (-S_max[i]-G[i,t]);
+let M_1[2] := min{i in I, t in T} (-D[i,t]);
+let M_1[3] := min{i in I, t in T} (-G[i,t]);
+let M_1[4] := min{i in I} (-S_max[i]);
+let M_1[5] := min{i in I, t in T} (-G[i,t]);
+let M_1[6] := min{i in I, t in T} (-D[i,t]);
+let M_1[7] := min{i in I} (-S_max[i]);
+# Estimated Values of M_2
+let {c in C} M_2[c] := min{i in I, t in T} lambda[c,i,t];
+
+### Define initial binary variables values ###
+param dec:= 5 integer;
+param tol:= 10^-(dec);
+
+# For constraint (2)
+for {i in I, t in T}{
+	if (discharged[i,t] > tol) then let u[i,t] := 0;
+	if (charged[i,t] > tol) then let u[i,t] := 1;
+};
+
+# For KKT complementarities
+for {i in I, t in T}{
+	if (-y[i,t]+D[i,t]-e_P[i,t]-G[i,t] < -tol) then let z[1,i,t] := 0;
+	if (y[i,t]-D[i,t] < -tol) then let z[2,i,t] := 0;
+	if (x[i,t]-G[i,t] < -tol) then let z[3,i,t] := 0;
+	if (e_A[i,t]+e_P[i,t]-S_max[i] < -tol) then let z[4,i,t] := 0;
+	if (-x[i,t]< -tol) then let z[5,i,t] := 0;
+	if (-y[i,t] < -tol) then let z[6,i,t] := 0;
+	if (-e_P[i,t] < -tol) then let z[7,i,t] := 0;
+	for {c in C}{
+		if (lambda[c,i,t] < -tol) then let z[c,i,t] := 1;
+	};
+};
+
+let end_time:= time();
+let total_time:= end_time-start_time;
+
+# --------------------------------------------------------------------------------------------------------
+# PRINTING OUTPUT
+# --------------------------------------------------------------------------------------------------------
+print "BEGIN OUTPUT DATA";
+
+# Data Model Parameters
+print "param n :=", sprintf("%u" & ";\n",n);
+print "param t_max :=", sprintf("%u" & ";\n",t_max);
+print "param S_ini :=", {i in I} sprintf("%u %.3f" & (if i = n then ";\n" else "\n"), i, S_ini[i]);
+print "param S_max :=", {i in I} sprintf("%u %d" & (if i = n then ";\n" else "\n"), i, S_max[i]);
+print "param price_W :=", {t in T} sprintf("%u %.3f" & (if t = t_max then ";\n" else "\n"), t, price_W[t]);
+print "param price_R :=", {t in T} sprintf("%u %.3f" & (if t = t_max then ";\n" else "\n"), t, price_R[t]);
+print "param B :=", {t in T} sprintf("%u %.4f" & (if t = t_max then ";\n" else "\n"), t, B[t]) ;
+print "param G :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.3f",G[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.3f",G[i,t])&";\n" 
+																   else sprintf("%.3f",G[i,t])&"\n")
+												  else " "&sprintf("%.3f",G[i,t])));
+print "param D :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.3f",D[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.3f",D[i,t])&";\n" 
+																   else sprintf("%.3f",D[i,t])&"\n") 
+												  else " "&sprintf("%.3f",D[i,t])));
+print "param niu :=", sprintf("%.2f" & ";\n",niu);
+print "param comp_A :=", sprintf("%.6f" & ";\n",comp_A);
+print "param comp_U :=", sprintf("%.6f" & ";\n",comp_U);
+print "param commission :=", sprintf("%.3f" & ";\n",commission);
+
+# Data for Initial solution
+print "param M_1 :=", {c in C} sprintf("%u %.3f" & (if c = 7 then ";\n" else "\n"), c, M_1[c]);
+print "param M_2 :=", {c in C} sprintf("%u %.3f" & (if c = 7 then ";\n" else "\n"), c, M_2[c]);
+
+# Leader variables
+print "param charged_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",charged[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",charged[i,t])&";\n" 
+																   else sprintf("%.4f",charged[i,t])&"\n") 
+												  else " "&sprintf("%.4f",charged[i,t])));
+
+print "param discharged_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",discharged[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",discharged[i,t])&";\n" 
+																   else sprintf("%.4f",discharged[i,t])&"\n") 
+												  else " "&sprintf("%.4f",discharged[i,t])));
+print "param e_A_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",e_A[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",e_A[i,t])&";\n" 
+																   else sprintf("%.4f",e_A[i,t])&"\n") 
+												  else " "&sprintf("%.4f",e_A[i,t])));
+
+# Follower variables
+print "param x_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",x[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",x[i,t])&";\n" 
+																   else sprintf("%.4f",x[i,t])&"\n") 
+												  else " "&sprintf("%.4f",x[i,t])));
+print "param y_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",y[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",y[i,t])&";\n" 
+																   else sprintf("%.4f",y[i,t])&"\n") 
+												  else " "&sprintf("%.4f",y[i,t])));
+print "param e_P_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",e_P[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",e_P[i,t])&";\n" 
+																   else sprintf("%.4f",e_P[i,t])&"\n") 
+												  else " "&sprintf("%.4f",e_P[i,t])));
+
+# Auxiliary variables
+print "param mu_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",mu[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%.4f",mu[i,t])&";\n" 
+																   else sprintf("%.4f",mu[i,t])&"\n") 
+												  else " "&sprintf("%.4f",mu[i,t])));
+print "param u_sol :", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+					{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%u",u[i,t]) 
+											else (if t=t_max then (if i=n then sprintf("%u",u[i,t])&";\n" 
+																   else sprintf("%u",u[i,t])&"\n") 
+												  else " "&sprintf("%u",u[i,t])));
+print "param lambda_sol :=";
+for{c in C}{
+	if c < 7 then 
+		print "[",sprintf("%u",c),",*,*]:", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+							{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",lambda[c,i,t]) 
+													else (if t=t_max then (sprintf("%.4f",lambda[c,i,t])&"\n") 
+														  else " "&sprintf("%.4f",lambda[c,i,t])));
+	else
+		print "[",sprintf("%u",c),",*,*]:", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+							{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%.4f",lambda[c,i,t]) 
+													else (if t=t_max then (if i=n then sprintf("%.4f",lambda[c,i,t])&";\n" 
+																		   else sprintf("%.4f",lambda[c,i,t])&"\n") 
+														  else " "&sprintf("%.4f",lambda[c,i,t]))); };
+print "param z_sol :=";
+for{c in C}{
+	if c < 7 then 
+		print "[",sprintf("%u",c),",*,*]:", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+							{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%u",z[c,i,t]) 
+													else (if t=t_max then (sprintf("%u",z[c,i,t])&"\n") 
+														  else " "&sprintf("%u",z[c,i,t])));
+	else
+		print "[",sprintf("%u",c),",*,*]:", {t in T} sprintf("%u" & (if t=t_max then ":=\n" else " "), t),
+							{i in I, t in T} sprintf(if t=1 then i&" "&sprintf("%u",z[c,i,t]) 
+													else (if t=t_max then (if i=n then sprintf("%u",z[c,i,t])&";\n" 
+																		   else sprintf("%u",z[c,i,t])&"\n") 
+														  else " "&sprintf("%u",z[c,i,t]))); };
+
+# Data for computational experiment
+print "param time_phase_0 :=", sprintf("%.6f" & ";\n",time_phase_0);
+print "param time_phase_1 :=", sprintf("%.6f" & ";\n",total_time);
+print "param UL_OBJ_REG :=", sprintf("%.3f" & ";\n",profit_aggregator);
+
+print "END OUTPUT DATA";
